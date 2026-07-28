@@ -1,0 +1,58 @@
+[project]
+name = "lelamp"
+version = "0.1.0"
+description = "6-DOF expressive lamp: perception, FSM behavior, memory, conversation"
+requires-python = ">=3.11"
+dependencies = [
+    "opencv-python>=4.10",
+    "mediapipe>=0.10",
+    "ultralytics>=8.3",
+    "open-clip-torch>=2.24",
+    "torch>=2.3",
+    "sqlite-vec>=0.1",
+    "pydantic>=2.7",
+    "anthropic>=0.34",
+    "sounddevice>=0.4",
+    "silero-vad>=5.1",
+    "faster-whisper>=1.0",
+    "pyserial>=3.5",
+    "mujoco>=3.1",
+    "ikpy>=3.4",
+    "numpy>=1.26",
+    "opentelemetry-sdk>=1.25",
+    "structlog>=24.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["lelamp"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "N"]
+
+[tool.mypy]
+strict = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["mujoco.*", "ikpy.*", "serial.*", "cv2.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

@@ -15,7 +15,9 @@ def test_frame_schema() -> None:
 
 
 def test_gaze_event_schema() -> None:
-    event = GazeEvent(frame_id=1, timestamp=0.0, gaze_score=0.9, num_faces=1)
+    event = GazeEvent(
+        frame_id=1, timestamp=0.0, face_present=True, gaze_score=0.9, num_faces=1
+    )
     assert 0.0 <= event.gaze_score <= 1.0
 
 

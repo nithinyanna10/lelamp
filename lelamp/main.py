@@ -1,67 +1,94 @@
 from __future__ import annotations
 
 import asyncio
+import signal
+import time
 
 import structlog
 
-from lelamp.behavior.motor import make_motor_backend
-from lelamp.perception.audio import SpeechEvent, audio_task
+from lelamp.behavior.expressions import HOME_DURATION_S, HOME_POSE, WAKE_DURATION_S, WAKE_POSE
+from lelamp.behavior.motor import MotorBackend, make_motor_backend
 from lelamp.perception.camera import Frame, camera_task
-from lelamp.perception.face_gaze import GazeEvent, LampPosition, face_gaze_task
-from lelamp.perception.scene_scan import Detections, scene_scan_task
-from lelamp.state.fsm import LampFSM
+from lelamp.perception.debug_overlay import debug_overlay_task
+from lelamp.perception.face_gaze import DebugFrame, GazeEvent, face_gaze_task
+from lelamp.perception.hysteresis import EngagementTransition, HysteresisGate
+from lelamp.state.fsm import LampFSM, LampState
 from lelamp.telemetry import init_telemetry
 
 log = structlog.get_logger()
 
-SCENE_SCAN_VOCABULARY = ["water bottle", "mug", "phone", "keys", "book", "laptop"]
 
-
-async def brain_task(
-    gaze_queue: asyncio.Queue[GazeEvent],
-    detections_queue: asyncio.Queue[Detections],
-    speech_queue: asyncio.Queue[SpeechEvent],
-    fsm: LampFSM,
+async def hysteresis_task(
+    gate: HysteresisGate,
+    in_queue: asyncio.Queue[GazeEvent],
+    out_queue: asyncio.Queue[EngagementTransition],
 ) -> None:
     while True:
-        gaze_event = await gaze_queue.get()
-        transition = fsm.on_gaze_event(gaze_event)
+        event = await in_queue.get()
+        transition = gate.update(event.gaze_score, timestamp=event.timestamp)
         if transition is not None:
-            log.info("fsm_transition", **transition.model_dump())
+            out_queue.put_nowait(transition)
+
+
+async def fsm_motor_task(
+    fsm: LampFSM, in_queue: asyncio.Queue[EngagementTransition], motor: MotorBackend
+) -> None:
+    while True:
+        event = await in_queue.get()
+        transition = fsm.on_engagement_transition(event)
+        if transition is None:
+            continue
+        # Latency budget: "engagement transition -> first motor command dispatched" < 250ms p95.
+        dispatch_latency_ms = (time.monotonic() - event.timestamp) * 1000.0
+        log.info(
+            "fsm_transition",
+            dispatch_latency_ms=round(dispatch_latency_ms, 1),
+            **transition.model_dump(),
+        )
+        if transition.to_state == LampState.ENGAGED:
+            await motor.move_to(WAKE_POSE, duration_s=WAKE_DURATION_S)
+        elif transition.to_state == LampState.IDLE:
+            await motor.move_to(HOME_POSE, duration_s=HOME_DURATION_S)
 
 
 async def run() -> None:
-    init_telemetry()
+    provider = init_telemetry()
 
     frame_queue: asyncio.Queue[Frame] = asyncio.Queue(maxsize=2)
     gaze_queue: asyncio.Queue[GazeEvent] = asyncio.Queue(maxsize=32)
-    detections_queue: asyncio.Queue[Detections] = asyncio.Queue(maxsize=8)
-    speech_queue: asyncio.Queue[SpeechEvent] = asyncio.Queue(maxsize=32)
+    debug_queue: asyncio.Queue[DebugFrame] = asyncio.Queue(maxsize=2)
+    engagement_queue: asyncio.Queue[EngagementTransition] = asyncio.Queue(maxsize=32)
 
     motor = make_motor_backend()
     await motor.connect()
+    await motor.move_to(HOME_POSE, duration_s=HOME_DURATION_S)
 
-    lamp_position = LampPosition(x=0.0, y=0.0, z=0.0)
+    gate = HysteresisGate()
     fsm = LampFSM()
 
     tasks = [
         asyncio.create_task(camera_task(frame_queue), name="camera"),
-        asyncio.create_task(
-            face_gaze_task(frame_queue, gaze_queue, lamp_position), name="face_gaze"
-        ),
-        asyncio.create_task(
-            scene_scan_task(frame_queue, detections_queue, SCENE_SCAN_VOCABULARY), name="scene_scan"
-        ),
-        asyncio.create_task(audio_task(speech_queue), name="audio"),
-        asyncio.create_task(
-            brain_task(gaze_queue, detections_queue, speech_queue, fsm), name="brain"
-        ),
+        asyncio.create_task(face_gaze_task(frame_queue, gaze_queue, debug_queue), name="face_gaze"),
+        asyncio.create_task(hysteresis_task(gate, gaze_queue, engagement_queue), name="hysteresis"),
+        asyncio.create_task(fsm_motor_task(fsm, engagement_queue, motor), name="fsm_motor"),
+        asyncio.create_task(debug_overlay_task(debug_queue, gate, fsm), name="debug_overlay"),
     ]
 
-    try:
-        await asyncio.gather(*tasks)
-    finally:
-        await motor.close()
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, stop_event.set)
+
+    await asyncio.wait(
+        [*tasks, asyncio.create_task(stop_event.wait())], return_when=asyncio.FIRST_COMPLETED
+    )
+
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    await motor.close()
+    provider.shutdown()
 
 
 def main() -> None:

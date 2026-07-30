@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import pytest
-
-from lelamp.perception.face_gaze import GazeEvent
-from lelamp.state.fsm import HysteresisConfig, LampFSM, LampState
+from lelamp.perception.hysteresis import EngagementTransition
+from lelamp.state.fsm import LampFSM, LampState
 
 
 def test_fsm_starts_idle() -> None:
@@ -11,16 +9,35 @@ def test_fsm_starts_idle() -> None:
     assert fsm.state == LampState.IDLE
 
 
-def test_hysteresis_defaults_match_spec() -> None:
-    config = HysteresisConfig()
-    assert config.engage_threshold == 0.7
-    assert config.engage_duration_s == 0.4
-    assert config.disengage_threshold == 0.3
-    assert config.disengage_duration_s == 1.5
-
-
-def test_on_gaze_event_not_yet_implemented() -> None:
+def test_engaged_transition_moves_idle_to_engaged() -> None:
     fsm = LampFSM()
-    event = GazeEvent(frame_id=1, timestamp=0.0, gaze_score=0.9, num_faces=1)
-    with pytest.raises(NotImplementedError):
-        fsm.on_gaze_event(event)
+    transition = fsm.on_engagement_transition(EngagementTransition(timestamp=1.0, engaged=True))
+    assert transition is not None
+    assert transition.from_state == LampState.IDLE
+    assert transition.to_state == LampState.ENGAGED
+    assert transition.reason == "gaze_engaged"
+    assert fsm.state == LampState.ENGAGED
+
+
+def test_disengaged_transition_moves_engaged_to_idle() -> None:
+    fsm = LampFSM()
+    fsm.on_engagement_transition(EngagementTransition(timestamp=1.0, engaged=True))
+    transition = fsm.on_engagement_transition(EngagementTransition(timestamp=2.0, engaged=False))
+    assert transition is not None
+    assert transition.from_state == LampState.ENGAGED
+    assert transition.to_state == LampState.IDLE
+    assert transition.reason == "gaze_disengaged"
+    assert fsm.state == LampState.IDLE
+
+
+def test_redundant_engaged_transition_is_a_noop() -> None:
+    fsm = LampFSM()
+    fsm.on_engagement_transition(EngagementTransition(timestamp=1.0, engaged=True))
+    assert fsm.on_engagement_transition(EngagementTransition(timestamp=1.5, engaged=True)) is None
+    assert fsm.state == LampState.ENGAGED
+
+
+def test_disengaged_transition_while_already_idle_is_a_noop() -> None:
+    fsm = LampFSM()
+    assert fsm.on_engagement_transition(EngagementTransition(timestamp=1.0, engaged=False)) is None
+    assert fsm.state == LampState.IDLE

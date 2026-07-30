@@ -7,3 +7,4 @@ __pycache__/
 *.db
 eval_data/clips/*
 !eval_data/clips/.gitkeep
+models/

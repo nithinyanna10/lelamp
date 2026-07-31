@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 import urllib.request
 from pathlib import Path
@@ -23,6 +24,10 @@ DEFAULT_MODEL_PATH = Path("models/face_landmarker.task")
 # model's topology, not tunable. Right/left are the subject's own right/left.
 _RIGHT_EYE_OUTER, _RIGHT_EYE_INNER, _RIGHT_IRIS = 33, 133, 468
 _LEFT_EYE_INNER, _LEFT_EYE_OUTER, _LEFT_IRIS = 362, 263, 473
+_NOSE_TIP = 1
+
+_HEAD_AXIS_LENGTH_PX = 40
+_GAZE_ARROW_LENGTH_PX = 60
 
 HEAD_ANGLE_THRESHOLD_DEG = 15.0
 IRIS_OFFSET_THRESHOLD = 0.35
@@ -60,6 +65,13 @@ class DebugFrame(BaseModel):
     gaze_score: float
     num_faces: int
     inference_ms: float
+    head_pose_rpy: tuple[float, float, float] | None = None
+    iris_offset_left: tuple[float, float] | None = None
+    iris_offset_right: tuple[float, float] | None = None
+    # (x-axis endpoint, y-axis endpoint, z-axis endpoint), all from nose_px
+    nose_px: DebugFacePoint | None = None
+    head_axes_px: tuple[DebugFacePoint, DebugFacePoint, DebugFacePoint] | None = None
+    gaze_arrow_px: tuple[DebugFacePoint, DebugFacePoint] | None = None  # start, end
 
 
 def ensure_model(path: Path = DEFAULT_MODEL_PATH, url: str = MODEL_URL) -> Path:
@@ -167,6 +179,57 @@ def _bbox_px(landmarks: list[Any], width: int, height: int) -> tuple[int, int, i
     return int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
 
 
+def _head_axes_px(
+    matrix: np.ndarray, origin: DebugFacePoint, length_px: float = _HEAD_AXIS_LENGTH_PX
+) -> tuple[DebugFacePoint, DebugFacePoint, DebugFacePoint]:
+    """Endpoints for a 3-line head-pose gizmo (red=x, green=y, blue=z) from `origin`.
+
+    Approximation, not a true 3D projection: MediaPipe's facial transformation
+    matrix's column vectors are unit axes in a camera-aligned metric space (+X
+    right, +Y up, +Z toward camera); this just takes each column's (x, y)
+    components as a 2D pixel offset and ignores depth (z-into-the-screen has no
+    pixel-space meaning without a full projection matrix, which face_landmarker
+    doesn't expose). Y is negated because image rows increase downward while
+    the matrix's +Y is "up". Standard simplification for this kind of debug
+    overlay -- good enough to see "which way is the head pointing," not for
+    metric accuracy.
+    """
+    r = matrix[:3, :3]
+    points = []
+    for col in range(3):
+        axis = r[:, col]
+        px = origin.x + int(axis[0] * length_px)
+        py = origin.y - int(axis[1] * length_px)
+        points.append(DebugFacePoint(x=px, y=py))
+    return points[0], points[1], points[2]
+
+
+def _gaze_arrow_px(
+    eye_center: DebugFacePoint,
+    pitch_deg: float,
+    yaw_deg: float,
+    iris_offset_x: float,
+    iris_offset_y: float,
+    length_px: float = _GAZE_ARROW_LENGTH_PX,
+) -> tuple[DebugFacePoint, DebugFacePoint]:
+    """Arrow from the eye-center midpoint pointing in the combined head+iris
+    gaze direction. Approximation for the HUD, not a calibrated gaze vector:
+    head yaw/pitch give the coarse direction, iris offset nudges it -- same
+    60/40 head-dominant weighting as the score itself, for the same reason
+    (iris landmarks are noisier)."""
+    dx = math.sin(math.radians(yaw_deg)) * 0.6 + iris_offset_x * 0.4
+    dy = -math.sin(math.radians(pitch_deg)) * 0.6 + iris_offset_y * 0.4
+    norm = math.hypot(dx, dy)
+    if norm < 1e-6:
+        dx, dy = 0.0, -1.0
+    else:
+        dx, dy = dx / norm, dy / norm
+    end = DebugFacePoint(
+        x=eye_center.x + int(dx * length_px), y=eye_center.y + int(dy * length_px)
+    )
+    return eye_center, end
+
+
 class _Detector:
     """Owns the MediaPipe FaceLandmarker instance; detect() is synchronous and
     meant to be called via asyncio.to_thread (MediaPipe Tasks has no async API)."""
@@ -211,9 +274,11 @@ def _process(frame: Frame, result: Any, inference_ms: float) -> tuple[GazeEvent,
         return gaze_event, debug
 
     best_idx, best_score, best_pose, best_offset = 0, -1.0, (0.0, 0.0, 0.0), (0.0, 0.0)
+    best_matrix: np.ndarray | None = None
     for i in range(num_faces):
         landmarks = result.face_landmarks[i]
         pitch, yaw, roll = (0.0, 0.0, 0.0)
+        matrix = None
         if result.facial_transformation_matrixes:
             matrix = np.array(result.facial_transformation_matrixes[i])
             pitch, yaw, roll = _rotation_matrix_to_head_pose(matrix)
@@ -224,6 +289,7 @@ def _process(frame: Frame, result: Any, inference_ms: float) -> tuple[GazeEvent,
                 offset_x,
                 offset_y,
             )
+            best_matrix = matrix
 
     landmarks = result.face_landmarks[best_idx]
     xs = [lm.x for lm in landmarks]
@@ -249,6 +315,22 @@ def _process(frame: Frame, result: Any, inference_ms: float) -> tuple[GazeEvent,
         DebugFacePoint(x=int(landmarks[i].x * width), y=int(landmarks[i].y * height))
         for i in range(_LEFT_IRIS, _LEFT_IRIS + 5)
     ]
+
+    right_offset = _iris_offset_for_eye(landmarks, _RIGHT_IRIS, _RIGHT_EYE_INNER, _RIGHT_EYE_OUTER)
+    left_offset = _iris_offset_for_eye(landmarks, _LEFT_IRIS, _LEFT_EYE_INNER, _LEFT_EYE_OUTER)
+
+    nose = landmarks[_NOSE_TIP]
+    nose_px = DebugFacePoint(x=int(nose.x * width), y=int(nose.y * height))
+    head_axes_px = _head_axes_px(best_matrix, nose_px) if best_matrix is not None else None
+
+    eye_center_px = DebugFacePoint(
+        x=int((landmarks[_RIGHT_IRIS].x + landmarks[_LEFT_IRIS].x) / 2 * width),
+        y=int((landmarks[_RIGHT_IRIS].y + landmarks[_LEFT_IRIS].y) / 2 * height),
+    )
+    gaze_arrow_px = _gaze_arrow_px(
+        eye_center_px, best_pose[0], best_pose[1], best_offset[0], best_offset[1]
+    )
+
     debug = DebugFrame(
         image=frame.image,
         face_present=True,
@@ -257,6 +339,12 @@ def _process(frame: Frame, result: Any, inference_ms: float) -> tuple[GazeEvent,
         gaze_score=best_score,
         num_faces=num_faces,
         inference_ms=inference_ms,
+        head_pose_rpy=best_pose,
+        iris_offset_left=left_offset,
+        iris_offset_right=right_offset,
+        nose_px=nose_px,
+        head_axes_px=head_axes_px,
+        gaze_arrow_px=gaze_arrow_px,
     )
     return gaze_event, debug
 

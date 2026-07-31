@@ -1,24 +1,45 @@
 <mujoco model="scene">
     <include file="so101_new_calib.xml" />
 
+    <statistic center="0.32 0.02 0.26" extent="0.2" />
+
     <visual>
-        <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0" />
-        <rgba haze="0.15 0.25 0.35 1" />
-        <global azimuth="160" elevation="-20" />
+        <headlight diffuse="0.55 0.5 0.45" ambient="0.4 0.4 0.4" specular="0.1 0.1 0.1" />
+        <rgba haze="0.85 0.78 0.65 1" />
+        <global azimuth="240" elevation="15" />
     </visual>
 
     <asset>
-        <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512"
-            height="3072" />
-        <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4"
-            rgb2="0.1 0.2 0.3"
-            markrgb="0.8 0.8 0.8" width="300" height="300" />
+        <texture type="skybox" builtin="gradient" rgb1="0.95 0.92 0.86" rgb2="0.72 0.70 0.68"
+            width="512" height="3072" />
+        <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.42 0.28 0.16"
+            rgb2="0.35 0.23 0.13"
+            markrgb="0.5 0.38 0.26" width="300" height="300" />
         <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5"
-            reflectance="0.2" />
+            reflectance="0.05" />
+        <material name="backdrop" rgba="0.30 0.22 0.16 1" reflectance="0.02" />
     </asset>
 
     <worldbody>
-        <light pos="0 0 3.5" dir="0 0 -1" directional="true" />
+        <!-- Key: warm, from above-left -->
+        <light name="key" pos="-0.4 0.5 1.0" dir="0.35 -0.45 -0.85" directional="true"
+            diffuse="0.9 0.85 0.75" specular="0.2 0.2 0.2" />
+        <!-- Fill: cooler, from the right, softer -->
+        <light name="fill" pos="0.6 -0.6 0.6" dir="-0.5 0.5 -0.4" directional="true"
+            diffuse="0.5 0.55 0.6" specular="0 0 0" />
+        <!-- Ambient top-down, gentle -->
+        <light name="ambient_top" pos="0 0 3.5" dir="0 0 -1" directional="true"
+            diffuse="0.25 0.24 0.22" specular="0 0 0" />
+
         <geom name="floor" size="0 0 0.05" pos="0 0 0" type="plane" material="groundplane" />
+        <!-- Backdrop: removes the infinite-floor horizon behind the lamp -->
+        <geom name="backdrop" type="plane" pos="-1.4 0 1.0" quat="0.7071068 0 0.7071068 0"
+            size="0 1.8 0.05" material="backdrop" />
+
+        <!-- Reproducible framing: lamp head near vertical center, closer/lower 3/4 view.
+             mode="targetbody" lets MuJoCo compute the aim direction natively -- avoids
+             hand-derived look-at axes (a real bug source elsewhere in this session). -->
+        <camera name="demo_cam" pos="0.58 -0.40 0.13" mode="targetbody"
+            target="moving_jaw_so101_v1" />
     </worldbody>
 </mujoco>

@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import time
 import wave
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -68,16 +69,26 @@ class ExpressionPlayer:
     """
 
     def __init__(
-        self, motor: MotorBackend, idle_overlay: IdleOverlay, tick_hz: float = 30.0
+        self,
+        motor: MotorBackend,
+        idle_overlay: IdleOverlay,
+        tick_hz: float = 30.0,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        # clock is injectable so tests can accelerate expression playback without
+        # touching the process-wide `time` module -- monkeypatching that globally
+        # was tried and rejected: it also perturbs asyncio's own internal
+        # scheduling (event loop deadlines, asyncio.sleep), which hung the test
+        # suite rather than speeding it up.
         self._motor = motor
         self._idle = idle_overlay
         self._tick_dt = 1.0 / tick_hz
+        self._clock = clock
         self._task: asyncio.Task[None] | None = None
         self._current_name: str | None = None
         self._current_interruptible: bool = True
         self._look_at: tuple[float, float] | None = None
-        self._epoch = time.monotonic()
+        self._epoch = self._clock()
 
         # Tracked, not physically driven: no MotorBackend API exists for light
         # output (that would mean touching motor.py, out of scope this step).
@@ -132,7 +143,7 @@ class ExpressionPlayer:
         with _tracer.start_as_current_span("expression.play") as span:
             span.set_attribute("name", expr.name)
             span.set_attribute("intensity", intensity)
-            t0 = time.monotonic()
+            t0 = self._clock()
             preempted = False
             try:
                 await self._play_once(expr, intensity)
@@ -142,11 +153,16 @@ class ExpressionPlayer:
                 preempted = True
                 raise
             finally:
-                span.set_attribute("duration_actual_ms", (time.monotonic() - t0) * 1000.0)
+                span.set_attribute("duration_actual_ms", (self._clock() - t0) * 1000.0)
                 span.set_attribute("preempted", preempted)
 
         if expr.return_to_idle and not preempted:
-            await self._motor.move_to(HOME_POSE, duration_s=0.4)
+            # Route through _apply_look_at: without this, a lamp actively tracking a
+            # face would visibly snap its head away from them the instant any
+            # return_to_idle expression finishes -- look_at_face is documented as a
+            # continuous override ("everything else continues"), and the home-blend
+            # is not an exception to that.
+            await self._motor.move_to(self._apply_look_at(list(HOME_POSE)), duration_s=0.4)
 
     def _apply_look_at(self, vector: list[float]) -> list[float]:
         if self._look_at is None:
@@ -180,7 +196,7 @@ class ExpressionPlayer:
         n_segments = len(expr.keyframes) - 1
         played_audio: set[int] = set()
         seg_idx = 0
-        t_start = time.monotonic()
+        t_start = self._clock()
         last_kf_ms = expr.keyframes[-1].t_ms
 
         # Loop until duration_ms, not just the last keyframe's t_ms: the gap between
@@ -188,7 +204,7 @@ class ExpressionPlayer:
         # skipping it here made every expression with one finish measurably faster
         # than its spec'd duration, caught by timing play() against real durations.
         while True:
-            elapsed_ms = (time.monotonic() - t_start) * 1000.0
+            elapsed_ms = (self._clock() - t_start) * 1000.0
             if elapsed_ms >= expr.duration_ms:
                 break
 
@@ -229,10 +245,20 @@ class ExpressionPlayer:
                 )[0]
                 self.current_light_color = resolved_color[seg_idx + 1]
 
-            idle_offset = self._idle.sample(time.monotonic() - self._epoch)
+            idle_offset = self._idle.sample(self._clock() - self._epoch)
             combined = list(base_target)
             for joint_name, offset in idle_offset.items():
                 combined[LAMP_JOINT_NAMES.index(joint_name)] += offset
             combined = self._apply_look_at(combined)
 
             await self._motor.move_to(combined, duration_s=self._tick_dt)
+            # Explicit cooperative yield: real backends' move_to() already suspends
+            # (awaits an asyncio.Event tied to the trajectory thread), so this is a
+            # no-op there. But the player shouldn't rely on that for correctness --
+            # a MotorBackend whose move_to() never actually awaits anything (a
+            # perfectly valid mock; conftest.py's FakeMotorBackend is exactly this)
+            # would otherwise let a looping expression's tick loop monopolize the
+            # event loop forever, since nothing else -- including a stop() call from
+            # another task -- can ever get scheduled to run. Found via a genuine
+            # test hang, not theorized.
+            await asyncio.sleep(0)

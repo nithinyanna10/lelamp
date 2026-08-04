@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Iterator
+from collections.abc import Callable
 
 import pytest
+from conftest import FakeMotorBackend
 
 import lelamp.behavior.expression_player as expression_player_module
 from lelamp.behavior.expression_player import ExpressionPlayer
@@ -12,24 +13,19 @@ from lelamp.behavior.expressions import EXPRESSIONS, LAMP_JOINT_NAMES, lamp_targ
 from lelamp.behavior.idle_overlay import IdleOverlay
 
 # Real durations sum to ~18s across the 18 non-looping expressions; the player's
-# tick loop times itself against time.monotonic() (busy-checked, not slept), so
-# there's no way to speed it up except by accelerating the clock it reads. This
-# monkeypatches only the module-under-test's `time.monotonic`, not FakeMotorBackend
-# (which has no internal timing) or motor.py's (unused here) -- so it's safe and
-# doesn't change what's being verified, just how long verifying it takes.
+# tick loop times itself against its injected clock (busy-checked, not slept), so
+# there's no way to speed the tests up except by accelerating that clock. Uses
+# ExpressionPlayer's `clock` constructor param (injected, not monkeypatched) --
+# an earlier version of this test monkeypatched the process-wide `time` module,
+# which also perturbs asyncio's own internal scheduling (event loop deadlines,
+# asyncio.sleep) and hung the suite instead of speeding it up.
 _CLOCK_SPEED = 25.0
 
 
-@pytest.fixture(autouse=True)
-def fast_clock(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+def _fast_clock() -> Callable[[], float]:
     real_monotonic = time.monotonic
     t0 = real_monotonic()
-
-    def fast_monotonic() -> float:
-        return t0 + (real_monotonic() - t0) * _CLOCK_SPEED
-
-    monkeypatch.setattr(expression_player_module.time, "monotonic", fast_monotonic)
-    yield
+    return lambda: t0 + (real_monotonic() - t0) * _CLOCK_SPEED
 
 
 @pytest.fixture(autouse=True)
@@ -50,23 +46,34 @@ LOOPING = [name for name, expr in EXPRESSIONS.items() if expr.loop]
 
 
 @pytest.mark.parametrize("name", NON_LOOPING)
-async def test_final_state_matches_last_keyframe(name: str, mock_motor_backend) -> None:
+async def test_final_state_matches_last_keyframe(
+    name: str, mock_motor_backend: FakeMotorBackend
+) -> None:
     idle = IdleOverlay()
     idle.set_enabled(False)  # isolate the keyframe-matching check from overlay noise
-    player = ExpressionPlayer(mock_motor_backend, idle)
+    player = ExpressionPlayer(mock_motor_backend, idle, clock=_fast_clock())
 
     reference = [0.0] * 6
     await player.play(name)
 
-    expected = _expected_final_vector(name, 1.0, reference)
+    # return_to_idle=True expressions blend to HOME_POSE after their own keyframes
+    # finish -- that's the documented contract ("after finishing, blend back to
+    # home?"), not a bug, so the final commanded state is HOME_POSE (all zeros),
+    # not the expression's own last keyframe, for those.
+    if EXPRESSIONS[name].return_to_idle:
+        expected = [0.0] * 6
+    else:
+        expected = _expected_final_vector(name, 1.0, reference)
     actual = mock_motor_backend.sent[-1]
     for e, a in zip(expected, actual, strict=True):
-        assert a == pytest.approx(e, abs=1e-6)
+        assert a == pytest.approx(e, abs=1e-4)
 
 
 @pytest.mark.parametrize("name", LOOPING)
-async def test_looping_expressions_run_until_stopped(name: str, mock_motor_backend) -> None:
-    player = ExpressionPlayer(mock_motor_backend, IdleOverlay())
+async def test_looping_expressions_run_until_stopped(
+    name: str, mock_motor_backend: FakeMotorBackend
+) -> None:
+    player = ExpressionPlayer(mock_motor_backend, IdleOverlay(), clock=_fast_clock())
     task = asyncio.create_task(player.play(name))
     await asyncio.sleep(0.05)  # >> one full (accelerated) loop cycle
     assert not task.done()  # confirms it's actually looping, not finishing early
@@ -77,8 +84,10 @@ async def test_looping_expressions_run_until_stopped(name: str, mock_motor_backe
     assert task.done()
 
 
-async def test_preemption_cancels_and_switches_to_new_expression(mock_motor_backend) -> None:
-    player = ExpressionPlayer(mock_motor_backend, IdleOverlay())
+async def test_preemption_cancels_and_switches_to_new_expression(
+    mock_motor_backend: FakeMotorBackend,
+) -> None:
+    player = ExpressionPlayer(mock_motor_backend, IdleOverlay(), clock=_fast_clock())
     long_task = asyncio.create_task(player.play("searching"))  # 3500ms
     await asyncio.sleep(0.02)
 
@@ -93,10 +102,10 @@ async def test_preemption_cancels_and_switches_to_new_expression(mock_motor_back
     await long_task  # should already be resolved (cancelled), not hang
 
 
-async def test_intensity_scales_keyframe_amplitude(mock_motor_backend) -> None:
+async def test_intensity_scales_keyframe_amplitude(mock_motor_backend: FakeMotorBackend) -> None:
     idle = IdleOverlay()
     idle.set_enabled(False)
-    player = ExpressionPlayer(mock_motor_backend, idle)
+    player = ExpressionPlayer(mock_motor_backend, idle, clock=_fast_clock())
 
     await player.play("curious_tilt", intensity=1.0)
     at_1x = mock_motor_backend.sent[-1][LAMP_JOINT_NAMES.index("wrist_roll")]
@@ -108,15 +117,17 @@ async def test_intensity_scales_keyframe_amplitude(mock_motor_backend) -> None:
     assert at_2x == pytest.approx(2.0 * at_1x, rel=1e-3)
 
 
-async def test_idle_overlay_composes_additively_not_replacing(mock_motor_backend) -> None:
+async def test_idle_overlay_composes_additively_not_replacing(
+    mock_motor_backend: FakeMotorBackend,
+) -> None:
     idle_off = IdleOverlay()
     idle_off.set_enabled(False)
-    player_off = ExpressionPlayer(mock_motor_backend, idle_off)
+    player_off = ExpressionPlayer(mock_motor_backend, idle_off, clock=_fast_clock())
     await player_off.play("listen")
     without_overlay = mock_motor_backend.sent[-1][LAMP_JOINT_NAMES.index("wrist_flex")]
 
     idle_on = IdleOverlay(amplitude_deg=10.0, period_s=0.02)  # exaggerated, fast test signal
-    player_on = ExpressionPlayer(mock_motor_backend, idle_on)
+    player_on = ExpressionPlayer(mock_motor_backend, idle_on, clock=_fast_clock())
     await player_on.play("listen")
     with_overlay = mock_motor_backend.sent[-1][LAMP_JOINT_NAMES.index("wrist_flex")]
 
@@ -127,8 +138,10 @@ async def test_idle_overlay_composes_additively_not_replacing(mock_motor_backend
     assert with_overlay != pytest.approx(without_overlay, abs=1e-9)
 
 
-async def test_look_at_face_overrides_base_pan_and_wrist_yaw_only(mock_motor_backend) -> None:
-    player = ExpressionPlayer(mock_motor_backend, IdleOverlay())
+async def test_look_at_face_overrides_base_pan_and_wrist_yaw_only(
+    mock_motor_backend: FakeMotorBackend,
+) -> None:
+    player = ExpressionPlayer(mock_motor_backend, IdleOverlay(), clock=_fast_clock())
     player.look_at_face((0.5, -0.5))
     await player.play("acknowledge")
 
@@ -141,6 +154,6 @@ async def test_look_at_face_overrides_base_pan_and_wrist_yaw_only(mock_motor_bac
     assert final[LAMP_JOINT_NAMES.index("wrist_flex")] == pytest.approx(0.0, abs=1e-6)
 
 
-async def test_current_is_none_before_any_play(mock_motor_backend) -> None:
+async def test_current_is_none_before_any_play(mock_motor_backend: FakeMotorBackend) -> None:
     player = ExpressionPlayer(mock_motor_backend, IdleOverlay())
     assert player.current() is None

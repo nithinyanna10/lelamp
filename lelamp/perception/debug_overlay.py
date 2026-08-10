@@ -8,6 +8,8 @@ import cv2
 import numpy as np
 from pydantic import BaseModel
 
+from lelamp.behavior.expression_player import ExpressionPlayer
+from lelamp.behavior.expressions import EXPRESSIONS
 from lelamp.perception.face_gaze import DebugFrame
 from lelamp.perception.hysteresis import HysteresisGate
 from lelamp.state.fsm import LampFSM, LampState
@@ -15,6 +17,20 @@ from lelamp.state.fsm import LampFSM, LampState
 WINDOW_NAME = "perception debug"
 PANEL_WIDTH = 300
 HISTORY_LEN = 100  # ~3s at ~30fps
+STATE_HISTORY_SHOWN = 5
+
+
+class HudState:
+    """Scan/memory stats the debug panel shows, mutated by main.py's scan-writing
+    task after each write_scan() -- kept separate from LatencySample (below) for
+    the same reason that one is: HUD-only, nothing in the pipeline consumes it."""
+
+    def __init__(self) -> None:
+        self.last_scan_ts: float | None = None
+        self.last_scan_objects: int = 0
+        self.last_scan_new: int = 0
+        self.memory_total: int = 0
+        self.memory_recent: int = 0
 
 _GREEN = (0, 200, 0)
 _RED = (0, 0, 220)
@@ -103,6 +119,67 @@ def _text(
     return y + int(16 * scale)
 
 
+def _draw_state_history(panel: np.ndarray, x: int, y: int, fsm: LampFSM, now: float) -> int:
+    y = _text(panel, x, y, "state history:", _DIM)
+    history = fsm.get_state_history()[-STATE_HISTORY_SHOWN:]
+    if not history:
+        return _text(panel, x, y, " -", _DIM)
+    for transition in reversed(history):
+        ago_s = now - transition.timestamp
+        line = (
+            f" {-ago_s:.1f}s {transition.from_state.value}->{transition.to_state.value} "
+            f"({transition.reason})"
+        )
+        y = _text(panel, x, y, line, _WHITE, 0.85)
+    return y
+
+
+def _draw_expression_progress(
+    panel: np.ndarray, x: int, y: int, name: str | None, started_at: float, now: float
+) -> int:
+    if name is None:
+        return _text(panel, x, y, "expr: -", _DIM)
+    duration_ms = EXPRESSIONS[name].duration_ms if name in EXPRESSIONS else 0
+    progress = min(1.0, (now - started_at) * 1000.0 / duration_ms) if duration_ms else 1.0
+    y = _text(panel, x, y, f"expr: {name} ({progress * 100:.0f}%)", _WHITE)
+    bar_w = int((PANEL_WIDTH - 2 * x) * progress)
+    cv2.rectangle(panel, (x, y), (PANEL_WIDTH - x, y + 10), _WHITE, 1)
+    cv2.rectangle(panel, (x, y), (x + bar_w, y + 10), _YELLOW, -1)
+    return y + 18
+
+
+def _seeking_countdown_s(fsm: LampFSM, now: float) -> float | None:
+    t = fsm.timings
+    elapsed = now - fsm.state_entered_at
+    if fsm.state == LampState.DISENGAGING:
+        return t.disengaging_to_seeking1_s - elapsed
+    if fsm.state == LampState.SEEKING_1:
+        return t.seeking1_to_seeking2_s - elapsed
+    if fsm.state == LampState.SEEKING_2:
+        return t.seeking2_to_seeking3_s - elapsed
+    return None
+
+
+def _draw_scan_and_memory(panel: np.ndarray, x: int, y: int, fsm: LampFSM, hud: HudState) -> int:
+    if fsm.state == LampState.SCANNING:
+        y = _text(panel, x, y, "scanning...", _YELLOW)
+    elif hud.last_scan_ts is not None:
+        ago_s = time.monotonic() - hud.last_scan_ts
+        y = _text(
+            panel,
+            x,
+            y,
+            f"last scan: {ago_s:.1f}s ago, {hud.last_scan_objects} objects "
+            f"({hud.last_scan_new} new)",
+            _DIM,
+        )
+    else:
+        y = _text(panel, x, y, "last scan: -", _DIM)
+    return _text(
+        panel, x, y, f"memory: {hud.memory_total} objects ({hud.memory_recent} recent)", _DIM
+    )
+
+
 def _draw_panel(
     frame: DebugFrame,
     gate: HysteresisGate,
@@ -110,8 +187,9 @@ def _draw_panel(
     fps: float,
     score_history: deque[float],
     latency: _LatencyTracker,
-    last_transition_state: LampState,
-    last_transition_wall_time: float,
+    current_expr_name: str | None,
+    current_expr_started_at: float,
+    hud: HudState,
     height: int,
 ) -> np.ndarray:
     panel = np.zeros((height, PANEL_WIDTH, 3), dtype=np.uint8)
@@ -157,9 +235,17 @@ def _draw_panel(
     y = _text(panel, x + 20, y, f"{state_word}{suffix}", _WHITE)
     y += 10
 
-    ago_s = time.monotonic() - last_transition_wall_time
-    y = _text(panel, x, y, f"fsm: {last_transition_state.value.upper()} ({ago_s:.1f}s ago)")
-    y += 10
+    now = time.monotonic()
+    y = _text(panel, x, y, f"fsm: {fsm.state.value.upper()}", _WHITE, 1.1)
+    y += 4
+    y = _draw_expression_progress(panel, x, y, current_expr_name, current_expr_started_at, now)
+    countdown_s = _seeking_countdown_s(fsm, now)
+    if countdown_s is not None:
+        y = _text(panel, x, y, f"next escalation in {max(0.0, countdown_s):.0f}s", _YELLOW)
+    y = _draw_scan_and_memory(panel, x, y, fsm, hud)
+    y += 4
+    y = _draw_state_history(panel, x, y, fsm, now)
+    y += 6
 
     y = _text(panel, x, y, "latency (p50/p95):", _DIM)
     total_p50 = total_p95 = 0.0
@@ -192,6 +278,8 @@ async def debug_overlay_task(
     debug_queue: asyncio.Queue[DebugFrame],
     hysteresis_gate: HysteresisGate,
     fsm: LampFSM,
+    player: ExpressionPlayer,
+    hud: HudState | None = None,
     latency_queue: asyncio.Queue[LatencySample] | None = None,
     window_name: str = WINDOW_NAME,
 ) -> None:
@@ -200,8 +288,9 @@ async def debug_overlay_task(
     fps = 0.0
     score_history: deque[float] = deque(maxlen=HISTORY_LEN)
     latency = _LatencyTracker()
-    last_transition_state = fsm.state
-    last_transition_wall_time = time.monotonic()
+    hud = hud if hud is not None else HudState()
+    current_expr_name: str | None = None
+    current_expr_started_at = time.monotonic()
 
     async def drain_latency() -> None:
         if latency_queue is None:
@@ -224,9 +313,11 @@ async def debug_overlay_task(
             latency.record("cam_to_gaze", frame.inference_ms)
             score_history.append(frame.gaze_score)
 
-            if fsm.state != last_transition_state:
-                last_transition_state = fsm.state
-                last_transition_wall_time = now
+            # ExpressionPlayer doesn't expose "when did this start" -- polled here
+            # instead of touching that library (out of scope this step).
+            if player.current() != current_expr_name:
+                current_expr_name = player.current()
+                current_expr_started_at = now
 
             face_image = _draw_face_overlay(frame.image, frame)
             panel = _draw_panel(
@@ -236,8 +327,9 @@ async def debug_overlay_task(
                 fps,
                 score_history,
                 latency,
-                last_transition_state,
-                last_transition_wall_time,
+                current_expr_name,
+                current_expr_started_at,
+                hud,
                 face_image.shape[0],
             )
             canvas = np.hstack([panel, face_image])

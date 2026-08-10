@@ -50,7 +50,10 @@ strict = true
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["mujoco.*", "ikpy.*", "serial.*", "cv2.*", "mediapipe.*", "sounddevice.*"]
+module = [
+    "mujoco.*", "ikpy.*", "serial.*", "cv2.*", "mediapipe.*", "sounddevice.*",
+    "sqlite_vec.*", "open_clip.*", "ultralytics.*",
+]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

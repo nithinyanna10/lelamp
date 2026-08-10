@@ -34,6 +34,41 @@ class FakeMotorBackend(MotorBackend):
         self.connected = False
 
 
+class FakeExpressionPlayer:
+    """Stands in for ExpressionPlayer: records every dispatch instead of driving a
+    real motor. All three dispatch methods return immediately (no internal
+    awaits), so callers that create_task() one and yield once (asyncio.sleep(0))
+    see it reflected in .calls/.current() right away -- see fsm.py's _go()."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self._current: str | None = None
+
+    def current(self) -> str | None:
+        return self._current
+
+    async def play(self, name: str, intensity: float = 1.0) -> None:
+        self.calls.append(("play", name))
+        self._current = name
+
+    async def preempt(self, name: str, intensity: float = 1.0) -> None:
+        self.calls.append(("preempt", name))
+        self._current = name
+
+    async def play_chain(self, chain_name: str) -> None:
+        self.calls.append(("play_chain", chain_name))
+        self._current = chain_name
+
+    async def stop(self) -> None:
+        self.calls.append(("stop", ""))
+        self._current = None
+
+
+@pytest.fixture
+def mock_expression_player() -> FakeExpressionPlayer:
+    return FakeExpressionPlayer()
+
+
 class FakeSerialPort:
     """Stands in for pyserial.Serial: records every write, needs no real device."""
 

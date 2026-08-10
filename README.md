@@ -27,8 +27,10 @@ main.py                    orchestrator: creates queues, starts tasks, wires the
 ├── memory/
 │   ├── db.py                sqlite + sqlite-vec: objects / sightings / scenes, dedupe on write
 │   ├── embeddings.py         open_clip on MPS
+│   ├── writer.py             write_scan: dedupe-or-insert a scene's detections, save crops
 │   └── query.py              LLM tool implementations: query_memory, describe_current_scene,
-│                             point_at, remember
+│                             point_at, remember (+ query_by_class/query_recent/
+│                             describe_current_memory for the demo/eval scripts)
 ├── conversation/
 │   ├── stt.py                whisper.cpp/CoreML, faster-whisper fallback
 │   ├── llm.py                Claude streaming with tool use
@@ -91,12 +93,30 @@ Environment variables:
    `MuJoCoMotorBackend` (real MJCF, physics thread + asyncio-scheduled cv2 render loop),
    `ik.py` cross-validated against MuJoCo's own forward kinematics to 1e-16 m, OTel span
    per `move_to`. `scripts/demo_motion.py` is the smoke test.
-2. Camera + MediaPipe gaze + hysteresis
-3. FSM + wake behavior, OTel traces end-to-end
-4. Memory schema + CLIP embeddings + dedupe
+2. **Done** — camera + MediaPipe gaze + hysteresis, wired end-to-end in `main.py`.
+3. **Done** — FSM finalized + attention-seeking escalation: `state/fsm.py`'s
+   `LampFSM.handle_event()` is fully event-driven (`GazeEngaged`/`GazeDisengaged`/
+   `FacePresent`/`FaceLost`/`ScanComplete`/`Tick`) over 8 states (`SLEEPING`,
+   `IDLE`, `ENGAGED`, `SCANNING`, `DISENGAGING`, `SEEKING_1/2/3`; `LISTENING`/
+   `SPEAKING` are typed for steps 6/7 but unreachable). Every transition plays an
+   expression via `ExpressionPlayer.preempt()`/`play_chain()` and logs
+   `from_state`/`to_state`/`reason`/`dispatch_latency_ms` (OTel span + structlog).
+   Time-based escalation (`state/config.py`'s `FSMTimings`) is driven by `Tick`
+   events from a 500ms timer task, not polling. `debug_overlay.py`'s HUD gained
+   state history, current-expression progress bar, seeking countdown, and
+   scan/memory panels. `scripts/demo_full_loop.py` is the smoke test (thin
+   wrapper over `main.py`, same as `demo_perception.py`).
+4. **Done** — memory schema + CLIP embeddings + dedupe: `db.py` (sqlite + sqlite-vec,
+   2D normalized position -- 3D/point_at comes in step 7), `embeddings.py` (open_clip
+   ViT-B-32, batched), `writer.py` (dedupe: same class + cosine>0.85 + position within
+   0.3 + seen within 30min -> update, else insert + save crop), `query.py` (query_memory
+   hybrid semantic search, query_by_class/query_recent structured, describe_current_memory,
+   describe_current_scene, point_at, remember). `scene_scan.py` runs YOLO-World on demand,
+   triggered whenever the FSM first enters ENGAGED (single scan from home pose;
+   multi-viewpoint sweep synced to a pan sweep is a TODO). `scripts/demo_memory.py`
+   is the smoke test.
 5. Claude tools + streaming conversation
-6. Attention-seeking escalation
-7. Eval harness against recorded sessions
+6. Eval harness against recorded sessions
 
 ## Testing without hardware
 

@@ -26,6 +26,8 @@ def test_detections_schema() -> None:
         class_name="water bottle",
         confidence=0.8,
         bbox=BBox(x_min=0, y_min=0, x_max=1, y_max=1),
+        position_xy_normalized=(0.0, 0.0),
+        image_crop=np.zeros((1, 1, 3), dtype=np.uint8),
     )
     detections = Detections(frame_id=1, timestamp=0.0, scene_id="s1", detections=[det])
     assert detections.detections[0].class_name == "water bottle"
@@ -41,8 +43,8 @@ def test_object_record_schema() -> None:
         class_name="mug",
         first_seen_ts=0.0,
         last_seen_ts=1.0,
-        position_xyz_base_frame=(0.1, 0.2, 0.3),
+        position_xy_normalized=(0.1, 0.2),
         confidence=0.9,
         embedding=[0.0] * 8,
     )
-    assert record.position_xyz_base_frame == (0.1, 0.2, 0.3)
+    assert record.position_xy_normalized == (0.1, 0.2)
